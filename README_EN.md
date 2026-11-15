@@ -28,7 +28,7 @@ Automatic background update checker for all installed plugins.
 ## 📥 Installation
 
 1. Navigate to the [**Releases**](https://github.com/MaxExteraPlugins/plugin_update_checker/releases/latest) section.
-2. Download the `plugin_update_checker_v3.3.0.plugin` file.
+2. Download the `plugin_update_checker_v3.3.1.plugin` file.
 3. Send the file to your Telegram Saved Messages or open it via file manager in exteraGram / AyuGram.
 4. Tap the file in Telegram and choose **"Install plugin"**.
 
