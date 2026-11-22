@@ -45,9 +45,13 @@ except Exception:
     ValueAnimator = None
 
 try:
-    from android.graphics.drawable import GradientDrawable
+    from android.graphics.drawable import GradientDrawable, InsetDrawable
 except Exception:
     GradientDrawable = None
+    try:
+        from android.graphics.drawable import InsetDrawable
+    except Exception:
+        InsetDrawable = None
 from client_utils import (
     PLUGINS_QUEUE,
     RequestCallback,
@@ -102,7 +106,7 @@ __id__ = "plugin_update_checker"
 __name__ = "Plugin Update Checker"
 __description__ = "Checking for updates for your installed plugins from multiple channels."
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "3.3.1"
+__version__ = "3.3.3"
 __icon__ = "MaxExteraPluginsStickers/24"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.5.1"
@@ -352,9 +356,24 @@ if dynamic_proxy is not None and NotificationCenter is not None:
             except Exception:
                 pass
 
+
+    class _PluginsUpdatedDelegate(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+
+        def __init__(self, plugin):
+            self._plugin = plugin
+
+        def didReceivedNotification(self, nid, account, args):
+            try:
+                plugin = self._plugin
+                if plugin is not None:
+                    plugin._on_plugins_updated_notification()
+            except Exception:
+                pass
+
 else:
 
     _ConnectionStateDelegate = None
+    _PluginsUpdatedDelegate = None
 
 
 def entry_name(file_path):
@@ -407,6 +426,8 @@ class _DialogsCreateViewHook:
                 return
             self.plugin._injected_btn = None
             run_on_ui_thread(lambda: self.plugin._add_icon_to_fragment(fragment), 300)
+            if self.plugin._updates:
+                run_on_queue(self.plugin._reconcile_stored_updates, WORK_QUEUE, 350)
         except Exception:
             pass
 
@@ -421,6 +442,8 @@ class _DialogsResumeHook:
             if not self.plugin._is_main_dialogs_screen(fragment):
                 return
             self.plugin._add_icon_to_fragment(fragment)
+            if self.plugin._updates:
+                run_on_queue(self.plugin._reconcile_stored_updates, WORK_QUEUE, 100)
         except Exception:
             pass
 
@@ -435,6 +458,8 @@ class _DialogsVisibleHook:
             if not self.plugin._is_main_dialogs_screen(fragment):
                 return
             run_on_ui_thread(lambda: self.plugin._add_icon_to_fragment(fragment), 200)
+            if self.plugin._updates:
+                run_on_queue(self.plugin._reconcile_stored_updates, WORK_QUEUE, 250)
         except Exception:
             pass
 
@@ -1089,6 +1114,13 @@ class PluginUpdateCheckerPlugin(BasePlugin):
     def on_app_event(self, event_type):
         if hasattr(self, "_author_helper"):
             self._author_helper.on_event(event_type)
+        try:
+            ev_name = str(event_type).upper()
+            if "RESUME" in ev_name or "START" in ev_name:
+                if getattr(self, "_updates", None):
+                    run_on_queue(self._reconcile_stored_updates, WORK_QUEUE, 300)
+        except Exception:
+            pass
 
     def on_plugin_load(self):
         self._author_helper = AuthorChannelHelper(self, icon_sticker=globals().get("__icon__", "MaxExteraPluginsStickers/1"))
@@ -1141,9 +1173,12 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         self._download_progress_span = PROGRESS_DL1_SPAN
         self._updates = self._load_stored_updates()
         self._last_scan_exists = bool(self.get_setting("last_scan_done", False))
+        self._plugins_delegate = None
+        self._reconciling = False
         self._install_actionbar_hooks()
+        self._register_plugins_observer()
         run_on_ui_thread(self._inject_icon_now)
-        run_on_queue(self._reconcile_stored_updates, WORK_QUEUE, 2000)
+        run_on_queue(self._reconcile_stored_updates, WORK_QUEUE, 500)
         if self.get_setting("auto_check", False):
             self._start_auto_check_flow()
 
@@ -1157,6 +1192,7 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         if hasattr(self, "_author_helper"):
             self._author_helper.on_unload()
         self._stop_icon_pulse()
+        self._unregister_plugins_observer()
         try:
             if self._injected_btn is not None and View is not None:
                 self._injected_btn.setVisibility(View.GONE)
@@ -1628,6 +1664,32 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         except Exception:
             pass
 
+    def _get_pulse_insets(self, item):
+        try:
+            w = int(item.getWidth()) if item is not None else 0
+            h = int(item.getHeight()) if item is not None else 0
+        except Exception:
+            w = 0
+            h = 0
+        if w <= 0 or h <= 0:
+            w = self._dp(48)
+            h = self._dp(56)
+        pad = self._dp(2)
+        diff = h - w
+        if diff > 0:
+            top = (diff // 2) + pad
+            bottom = (diff - diff // 2) + pad
+            left = pad
+            right = pad
+            return left, top, right, bottom
+        elif diff < 0:
+            left = ((-diff) // 2) + pad
+            right = ((-diff) - (-diff) // 2) + pad
+            top = pad
+            bottom = pad
+            return left, top, right, bottom
+        return pad, pad, pad, pad
+
     def _start_icon_pulse(self, item):
         if _PulseUpdateListener is None or ValueAnimator is None:
             return
@@ -1644,7 +1706,14 @@ class PluginUpdateCheckerPlugin(BasePlugin):
                     drawable.mutate()
                 except Exception:
                     pass
-                item.setBackground(drawable)
+                applied_drawable = drawable
+                if InsetDrawable is not None:
+                    try:
+                        left, top, right, bottom = self._get_pulse_insets(item)
+                        applied_drawable = InsetDrawable(drawable, left, top, right, bottom)
+                    except Exception:
+                        applied_drawable = drawable
+                item.setBackground(applied_drawable)
             except Exception:
                 drawable = None
         try:
@@ -1656,6 +1725,18 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             anim.start()
             self._pulse_animator = anim
             self._pulse_target = item
+            if InsetDrawable is not None and drawable is not None and item is not None:
+                def update_insets():
+                    try:
+                        if self._pulse_target is item:
+                            left, top, right, bottom = self._get_pulse_insets(item)
+                            item.setBackground(InsetDrawable(drawable, left, top, right, bottom))
+                    except Exception:
+                        pass
+                try:
+                    item.post(update_insets)
+                except Exception:
+                    pass
         except Exception:
             self._pulse_animator = None
             self._pulse_target = None
@@ -1680,26 +1761,62 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             except Exception:
                 pass
 
+    def _on_updates_reconciled(self):
+        try:
+            self._update_actionbar_icon()
+            self._inject_icon_now()
+        except Exception:
+            pass
+
     def _reconcile_stored_updates(self):
         try:
             if not self._updates:
                 return
-            local = self._get_local_plugins()
-            kept = []
-            changed = False
-            for u in self._updates:
-                pid = u.get("plugin_id")
-                li = local.get(pid)
-                if li is None or not self._version_is_newer(str(u.get("channel_version", "")), str(li["version"])):
-                    changed = True
-                    continue
-                kept.append(u)
-            if changed:
-                self._updates = kept
-                self._store_last_results()
-                run_on_ui_thread(self._inject_icon_now)
-        except Exception:
-            pass
+            if getattr(self, "_reconciling", False):
+                return
+            self._reconciling = True
+            try:
+                local = self._get_local_plugins()
+                kept = []
+                changed = False
+                for u in self._updates:
+                    pid = u.get("plugin_id")
+                    channel_ver = str(u.get("channel_version", ""))
+                    li = local.get(pid)
+                    if li is None:
+                        # Plugin was deleted or uninstalled - remove from available updates
+                        changed = True
+                        if hasattr(self, "_up_to_date") and isinstance(self._up_to_date, list):
+                            self._up_to_date = [item for item in self._up_to_date if item.get("plugin_id") != pid]
+                        if hasattr(self, "_not_found") and isinstance(self._not_found, list):
+                            self._not_found = [item for item in self._not_found if item.get("plugin_id") != pid]
+                        continue
+
+                    local_ver = str(li.get("version", ""))
+                    if not self._version_is_newer(channel_ver, local_ver):
+                        # Plugin was updated to current or newer version
+                        changed = True
+                        if hasattr(self, "_up_to_date") and isinstance(self._up_to_date, list):
+                            self._up_to_date = [item for item in self._up_to_date if item.get("plugin_id") != pid]
+                            self._up_to_date.append({
+                                "plugin_id": pid,
+                                "name": li.get("name") or u.get("name", pid),
+                                "version": local_ver,
+                                "channel_id": u.get("channel_id"),
+                                "channel_username": u.get("channel_username"),
+                                "message_id": u.get("message_id"),
+                            })
+                        continue
+                    kept.append(u)
+                if changed:
+                    self._updates = kept
+                    self._store_last_results()
+                    run_on_ui_thread(self._on_updates_reconciled)
+            finally:
+                self._reconciling = False
+        except Exception as e:
+            self._reconciling = False
+            log(f"Error in _reconcile_stored_updates: {e}")
 
     def _add_icon_to_fragment(self, fragment):
         try:
@@ -1806,6 +1923,54 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             run_on_queue(self._start_check, WORK_QUEUE, 0)
 
         run_on_queue(begin, WORK_QUEUE, AUTO_CHECK_DELAY_MS)
+
+    def _register_plugins_observer(self):
+        try:
+            if getattr(self, "_plugins_delegate", None) is not None:
+                return
+            if NotificationCenter is None or _PluginsUpdatedDelegate is None:
+                return
+            plugins_updated_id = getattr(NotificationCenter, "pluginsUpdated", None)
+            if plugins_updated_id is None:
+                return
+            delegate = _PluginsUpdatedDelegate(self)
+            self._plugins_delegate = delegate
+            try:
+                NotificationCenter.getGlobalInstance().addObserver(delegate, int(plugins_updated_id))
+            except Exception:
+                pass
+            try:
+                if get_notification_center is not None:
+                    nc = get_notification_center()
+                    if nc is not None and nc != NotificationCenter.getGlobalInstance():
+                        nc.addObserver(delegate, int(plugins_updated_id))
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"Error registering plugins observer: {e}")
+
+    def _unregister_plugins_observer(self):
+        delegate = getattr(self, "_plugins_delegate", None)
+        if delegate is None or NotificationCenter is None:
+            return
+        plugins_updated_id = getattr(NotificationCenter, "pluginsUpdated", None)
+        if plugins_updated_id is not None:
+            try:
+                NotificationCenter.getGlobalInstance().removeObserver(delegate, int(plugins_updated_id))
+            except Exception:
+                pass
+            try:
+                if get_notification_center is not None:
+                    nc = get_notification_center()
+                    if nc is not None:
+                        nc.removeObserver(delegate, int(plugins_updated_id))
+            except Exception:
+                pass
+        self._plugins_delegate = None
+
+    def _on_plugins_updated_notification(self):
+        if getattr(self, "_updates", None):
+            run_on_queue(self._reconcile_stored_updates, WORK_QUEUE, 100)
 
     def _register_conn_observer(self):
         try:
@@ -2533,25 +2698,21 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             return plugins
 
         dir_path = str(plugins_dir)
-
         sources = []
-        for file_path in list_dir(dir_path, extensions=[".py"]) or []:
-            sources.append((str(file_path), "py"))
-
         try:
-            for name in os.listdir(dir_path):
-                full = os.path.join(dir_path, name)
-                low = name.lower()
-                if low.endswith((".elyx", ".eaf")):
+            for entry in os.listdir(dir_path):
+                full = os.path.join(dir_path, entry)
+                if not os.path.isfile(full):
+                    continue
+                if entry.startswith(".") or entry.startswith("_"):
+                    continue
+                lower = entry.lower()
+                if lower.endswith((".plugin", ".py")):
+                    sources.append((full, "py"))
+                elif lower.endswith((".elyx", ".eaf")):
                     sources.append((full, "elyx"))
-                elif os.path.isdir(full):
-                    for cand in ("metainfo.yml", "metainfo.yaml", "metainfo.json"):
-                        cand_path = os.path.join(full, cand)
-                        if os.path.isfile(cand_path):
-                            sources.append((cand_path, "meta"))
-                            break
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"Error listing plugins_dir: {e}")
 
         for file_path, kind in sources:
             try:
@@ -2561,16 +2722,6 @@ class PluginUpdateCheckerPlugin(BasePlugin):
                     meta = self._parse_plugin_metadata(content) if content else None
                 elif kind == "elyx":
                     meta = self._parse_elyx_file(file_path)
-                else:
-                    try:
-                        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                            raw = f.read()
-                    except Exception:
-                        raw = None
-                    if raw:
-                        meta = self._parse_elyx_meta_raw(raw, os.path.basename(file_path))
-                        if meta and meta.get("id") and not meta.get("version"):
-                            meta["version"] = "1.0.0"
                 if meta and meta.get("id"):
                     pid = meta["id"]
                     info = {
@@ -2582,17 +2733,8 @@ class PluginUpdateCheckerPlugin(BasePlugin):
                     if existing is None:
                         plugins[pid] = info
                     else:
-                        # the host loads the plugin from <id>.py / <id>.elyx /
-                        # <id>.eaf / a dir named <id>, so a stray copy with
-                        # the same id must never mask the active source
                         base = entry_name(file_path)
-                        active = (
-                            base == pid + ".py"
-                            or base == pid + ".elyx"
-                            or base == pid + ".eaf"
-                            or (kind == "meta" and os.path.basename(os.path.dirname(file_path)) == pid)
-                        )
-                        if active:
+                        if base.endswith(".plugin") or self._version_is_newer(str(info["version"]), str(existing.get("version", ""))):
                             plugins[pid] = info
             except Exception:
                 pass
@@ -3251,6 +3393,25 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             if not activity:
                 self._show_fallback_results()
                 return
+
+            if self._updates:
+                try:
+                    local = self._get_local_plugins()
+                    kept = []
+                    changed = False
+                    for u in self._updates:
+                        pid = u.get("plugin_id")
+                        li = local.get(pid)
+                        if li is None or not self._version_is_newer(str(u.get("channel_version", "")), str(li.get("version", ""))):
+                            changed = True
+                            continue
+                        kept.append(u)
+                    if changed:
+                        self._updates = kept
+                        self._store_last_results()
+                        self._update_actionbar_icon()
+                except Exception:
+                    pass
 
             updates = self._updates
             up_to_date = self._up_to_date
