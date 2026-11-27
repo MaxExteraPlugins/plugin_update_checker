@@ -61,15 +61,17 @@ from client_utils import (
     run_on_queue,
     send_request,
 )
+try:
+    if RequestCallback is not None and not hasattr(RequestCallback, "__call__"):
+        RequestCallback.__call__ = lambda self, response, error: self.run(response, error)
+except Exception:
+    pass
 from file_utils import get_plugins_dir, list_dir
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 from ui.settings import Divider, Header, Switch, Text
 
-try:
-    from client_utils import EXTERNAL_NETWORK_QUEUE as WORK_QUEUE
-except Exception:
-    WORK_QUEUE = PLUGINS_QUEUE
+WORK_QUEUE = PLUGINS_QUEUE
 
 try:
     from client_utils import get_connections_manager
@@ -106,7 +108,7 @@ __id__ = "plugin_update_checker"
 __name__ = "Plugin Update Checker"
 __description__ = "Checking for updates for your installed plugins from multiple channels."
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "3.3.5"
+__version__ = "3.3.9"
 __icon__ = "MaxExteraPluginsStickers/24"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.5.1"
@@ -199,6 +201,10 @@ STRINGS = {
         "channels_pick_selected": "Selected: {}",
         "channels_pick_manual": "Enter manually",
         "channels_none_available": "No public channels found among your chats. Use manual input.",
+        "channels_choose_method": "Choose how to configure channels:",
+        "channels_open_tg_picker": "Open TG picker",
+        "channels_enter_username": "Enter @username",
+        "channels_no_username_selected": "Selected chats have no public @username",
         "version_same_line": "{}  \u2192  {}",
         "channel_suffix": "@{}",
         "ignore_question": "Are you sure you want to ignore this update?",
@@ -292,6 +298,10 @@ STRINGS = {
         "channels_pick_selected": "Выбрано: {}",
         "channels_pick_manual": "Ввести вручную",
         "channels_none_available": "Среди ваших чатов нет публичных каналов. Используйте ручной ввод.",
+        "channels_choose_method": "Выберите способ настройки каналов:",
+        "channels_open_tg_picker": "Открыть TG пикер",
+        "channels_enter_username": "Указать @username",
+        "channels_no_username_selected": "У выбранных чатов нет публичного @username",
         "version_same_line": "{}  \u2192  {}",
         "channel_suffix": "@{}",
         "ignore_question": "Уверены, что хотите игнорировать данное обновление?",
@@ -1223,7 +1233,169 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         return int(value * 3)
 
     def _on_channels_click(self, view):
-        self._show_channels_picker()
+        self._show_channels_mode_dialog()
+
+    def _show_channels_mode_dialog(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            activity = fragment.getParentActivity()
+            if not activity:
+                return
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(self._s("channels_edit"))
+            current_sub = self._get_channels_subtext()
+            msg = self._s("channels_choose_method")
+            if current_sub:
+                msg = f"{msg}\n\n{current_sub}"
+            builder.set_message(msg)
+
+            def open_picker(bld, w):
+                try:
+                    bld.dismiss()
+                except Exception:
+                    pass
+                self._open_tg_channels_picker()
+
+            def open_manual(bld, w):
+                try:
+                    bld.dismiss()
+                except Exception:
+                    pass
+                self._show_channels_dialog()
+
+            builder.set_positive_button(self._s("channels_open_tg_picker"), open_picker)
+            builder.set_neutral_button(self._s("channels_enter_username"), open_manual)
+            builder.set_negative_button(self._s("cancel"), lambda bld, w: bld.dismiss())
+            builder.show()
+        except Exception as e:
+            log(f"Error showing channels mode dialog: {e}")
+            self._show_channels_dialog()
+
+    def _extract_chat_username(self, chat):
+        if chat is None:
+            return None
+        uname = getattr(chat, "username", None)
+        if uname:
+            return str(uname).lstrip("@")
+        try:
+            usernames = getattr(chat, "usernames", None)
+            if usernames is not None and usernames.size() > 0:
+                for i in range(usernames.size()):
+                    uobj = usernames.get(i)
+                    if uobj is not None and getattr(uobj, "active", True):
+                        val = getattr(uobj, "username", None)
+                        if val:
+                            return str(val).lstrip("@")
+        except Exception:
+            pass
+        return None
+
+    def _open_tg_channels_picker(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            if jclass is None or dynamic_proxy is None:
+                self._show_channels_dialog()
+                return
+
+            USA = jclass("org.telegram.ui.UsersSelectActivity")
+            DelCls = None
+            try:
+                DelCls = jclass("org.telegram.ui.UsersSelectActivity$FilterUsersActivityDelegate")
+            except Exception:
+                DelCls = getattr(USA, "FilterUsersActivityDelegate", None)
+
+            if USA is None or DelCls is None:
+                self._show_channels_dialog()
+                return
+
+            from java.util import ArrayList
+            from java.lang import Long as JLong
+
+            current = [c.lower() for c in self._get_channels_to_check()]
+            preselected = ArrayList()
+            preselected_unames = set()
+            mc = get_messages_controller()
+            if mc is not None:
+                try:
+                    all_chats = mc.getAllChats()
+                    if all_chats is not None:
+                        for i in range(int(all_chats.size())):
+                            chat = all_chats.valueAt(i)
+                            uname = self._extract_chat_username(chat)
+                            if uname and uname.lower() in current:
+                                cid = int(getattr(chat, "id", 0) or 0)
+                                if cid > 0:
+                                    preselected.add(JLong(-cid))
+                                    preselected_unames.add(uname.lower())
+                except Exception:
+                    pass
+
+            preserved = [c for c in self._get_channels_to_check() if c.lower() not in preselected_unames]
+
+            picker = None
+            try:
+                picker = USA(True, preselected, 0)
+            except Exception:
+                try:
+                    picker = USA(False, preselected, 0)
+                except Exception:
+                    picker = USA(0)
+
+            try:
+                picker.noChatTypes = True
+            except Exception:
+                pass
+            try:
+                picker.doNotNewChats = True
+            except Exception:
+                pass
+
+            plugin_ref = self
+
+            class _ChannelsDelegate(dynamic_proxy(DelCls)):
+                def didSelectChats(self, ids, flags):
+                    try:
+                        picked = []
+                        had_ids = False
+                        controller = get_messages_controller()
+                        if ids is not None and controller is not None:
+                            for i in range(int(ids.size())):
+                                did = int(ids.get(i))
+                                had_ids = True
+                                if did < 0:
+                                    chat = controller.getChat(-did)
+                                    uname = plugin_ref._extract_chat_username(chat)
+                                    if uname and uname not in picked:
+                                        picked.append(uname)
+                        if had_ids and not picked:
+                            run_on_ui_thread(lambda: BulletinHelper.show_error(plugin_ref._s("channels_no_username_selected")))
+                            return
+                        final = list(preserved)
+                        for u in picked:
+                            if u.lower() not in [x.lower() for x in final]:
+                                final.append(u)
+                        text = " ".join(final)
+                        try:
+                            plugin_ref.set_setting("custom_channels", text, reload_settings=True)
+                        except Exception:
+                            try:
+                                plugin_ref.set_setting("custom_channels", text)
+                            except Exception:
+                                pass
+                        run_on_ui_thread(lambda: BulletinHelper.show_info(plugin_ref._s("channels_saved")))
+                    except Exception as ex:
+                        log(f"Error in TG channels picker delegate: {ex}\n{traceback.format_exc()}")
+
+            picker.setDelegate(_ChannelsDelegate())
+            fragment.presentFragment(picker)
+        except Exception as e:
+            log(f"Error opening TG channels picker: {e}\n{traceback.format_exc()}")
+            self._show_channels_dialog()
 
     def _get_pickable_channels(self):
         try:
@@ -1780,23 +1952,16 @@ class PluginUpdateCheckerPlugin(BasePlugin):
 
     def _on_check_click(self, view):
         if self._checking:
-            if not self._silent_mode:
+            if not self._silent_mode and self._progress > 0 and time.time() - getattr(self, "_check_started_ts", 0) < 60.0:
                 self._show_loading_dialog()
                 return
             self._end_check()
-        if self._is_online():
-            self._silent_mode = False
-            self._progress = 0
-            self._progress_ts = 0
-            self._show_loading_dialog()
-            run_on_queue(self._start_check, WORK_QUEUE, 0)
-        else:
-            self._silent_mode = False
-            self._progress = 0
-            self._progress_ts = 0
-            self._show_loading_dialog()
-            self._set_progress(1, self._s("waiting_connection"))
-            self._wait_for_connection(self._start_queued_check)
+        self._silent_mode = False
+        self._progress = 0
+        self._progress_ts = 0
+        self._last_progress_message = self._s("reading_plugins")
+        self._show_loading_dialog()
+        self._run_bg(self._start_check, 0)
 
     def _start_queued_check(self):
         run_on_queue(self._start_check, WORK_QUEUE, 0)
@@ -1947,14 +2112,48 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         except Exception:
             return True
 
+    def _run_bg(self, fn, delay_ms=0):
+        res = None
+        try:
+            res = run_on_queue(fn, WORK_QUEUE, delay_ms)
+        except Exception as e:
+            log(f"run_on_queue error ({WORK_QUEUE}): {e}")
+        if res is None and WORK_QUEUE != PLUGINS_QUEUE:
+            try:
+                res = run_on_queue(fn, PLUGINS_QUEUE, delay_ms)
+            except Exception as e:
+                log(f"run_on_queue fallback error (PLUGINS_QUEUE): {e}")
+        if res is None:
+            def runner():
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+                try:
+                    fn()
+                except Exception as ex:
+                    log(f"bg thread error: {ex}\n{traceback.format_exc()}")
+            threading.Thread(target=runner, daemon=True).start()
+
     def _start_check(self):
         with self._lock:
             if self._checking:
                 return
             self._checking = True
+            self._check_started_ts = time.time()
+        try:
+            self._start_check_inner()
+        except Exception as e:
+            log(f"Fatal error in _start_check: {e}\n{traceback.format_exc()}")
+            self._end_check()
+            if not self._silent_mode:
+                run_on_ui_thread(self._dismiss_loading_dialog)
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {e}"))
+
+    def _start_check_inner(self):
         self._session += 1
         self._session_at_start = self._session
-        self._download_priority = FileLoader.PRIORITY_NORMAL if self._silent_mode else FileLoader.PRIORITY_HIGH
+        p_norm = getattr(FileLoader, "PRIORITY_NORMAL", 0)
+        p_high = getattr(FileLoader, "PRIORITY_HIGH", 1)
+        self._download_priority = p_norm if self._silent_mode else p_high
         self._incremental_since = 0
         if self._silent_mode:
             try:
@@ -2025,6 +2224,27 @@ class PluginUpdateCheckerPlugin(BasePlugin):
     def _session_changed(self):
         return self._session != self._session_at_start
 
+    def _send_tg_request(self, req, fn):
+        try:
+            send_request(req, fn)
+        except TypeError:
+            try:
+                send_request(req, RequestCallback(fn))
+            except Exception as e:
+                log(f"send_request fallback failed: {e}\n{traceback.format_exc()}")
+                raise
+
+    def _schedule_channel_watchdog(self, channel, step_name, timeout_s=30.0):
+        expected_session = self._session
+        expected_index = self._current_channel_index
+        def watchdog():
+            if self._session != expected_session or self._current_channel_index != expected_index:
+                return
+            log(f"Channel request timeout for @{channel} during {step_name}")
+            self._current_channel_error = "timeout"
+            self._finish_current_channel()
+        run_on_queue(watchdog, WORK_QUEUE, int(timeout_s * 1000.0))
+
     def _resolve_next_channel(self):
         if self._session_changed():
             return
@@ -2045,12 +2265,13 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             chan_pct = PROGRESS_SEARCH_BASE + int(PROGRESS_SEARCH_SPAN * self._current_channel_index / max(self._total_channels, 1))
             self._set_progress(chan_pct, self._s("resolving_channel", channel, self._current_channel_index + 1, self._total_channels))
 
+        self._schedule_channel_watchdog(channel, "resolve")
         try:
             req = TLRPC.TL_contacts_resolveUsername()
             req.username = channel
-            send_request(req, RequestCallback(self._on_channel_resolved))
+            self._send_tg_request(req, self._on_channel_resolved)
         except Exception as e:
-            log(f"Error resolving channel {channel}: {e}")
+            log(f"Error resolving channel {channel}: {e}\n{traceback.format_exc()}")
             self._current_channel_error = "resolve error"
             self._finish_current_channel()
 
@@ -2151,9 +2372,10 @@ class PluginUpdateCheckerPlugin(BasePlugin):
                 req.flags = 0
                 req.peer = peer
 
-            send_request(req, RequestCallback(self._on_documents_fetched))
+            self._schedule_channel_watchdog(self._current_channel_username, f"fetch page {self._current_channel_pages}")
+            self._send_tg_request(req, self._on_documents_fetched)
         except Exception as e:
-            log(f"Error searching documents: {e}")
+            log(f"Error searching documents: {e}\n{traceback.format_exc()}")
             self._current_channel_error = "search failed"
             self._finish_current_channel()
 
@@ -2650,7 +2872,7 @@ class PluginUpdateCheckerPlugin(BasePlugin):
                     if existing is None:
                         plugins[pid] = info
                     else:
-                        base = entry_name(file_path)
+                        base = os.path.basename(file_path)
                         if base.endswith(".plugin") or self._version_is_newer(str(info["version"]), str(existing.get("version", ""))):
                             plugins[pid] = info
             except Exception:
@@ -2868,17 +3090,36 @@ class PluginUpdateCheckerPlugin(BasePlugin):
                     builder.set_title(self._s("checking_title"))
                     builder.set_neutral_button(self._s("minimize"), lambda bld, w: self._minimize_check(bld))
                     builder.set_negative_button(self._s("cancel"), lambda bld, w: self._cancel_check(bld))
+                    msg = getattr(self, "_last_progress_message", None)
+                    if msg:
+                        try:
+                            builder.set_message(msg)
+                        except Exception:
+                            pass
                     dialog = builder.show()
+                    self._loading_dialog = dialog
+                    self._loading_builder = builder
                     try:
-                        dialog.set_progress(self._progress)
+                        if hasattr(dialog, "set_progress"):
+                            dialog.set_progress(self._progress)
+                        elif hasattr(dialog, "setProgress"):
+                            dialog.setProgress(self._progress)
+                        raw = dialog.get_dialog() if hasattr(dialog, "get_dialog") else dialog
+                        if raw and hasattr(raw, "setProgress"):
+                            raw.setProgress(self._progress)
                     except Exception:
                         pass
+                    if msg:
+                        try:
+                            raw = dialog.get_dialog() if hasattr(dialog, "get_dialog") else dialog
+                            if raw and hasattr(raw, "setMessage"):
+                                raw.setMessage(msg)
+                        except Exception:
+                            pass
                     try:
                         dialog.setCancelable(True)
                     except Exception:
                         pass
-                    self._loading_dialog = dialog
-                    self._loading_builder = builder
                 except Exception as e:
                     log(f"Error showing loading dialog: {e}")
 
@@ -2910,34 +3151,44 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         except Exception:
             pass
 
-    def _set_progress(self, percent, message):
+    def _set_progress(self, percent, message, force=False):
         if self._silent_mode:
             return
         try:
             percent = min(int(percent), 100)
-            if percent <= self._progress:
+            msg_changed = getattr(self, "_last_progress_message", None) != message
+            if not force and percent <= self._progress and not msg_changed:
                 return
-            if percent < 100:
-                now = time.time() * 1000.0
+            now = time.time() * 1000.0
+            if not force and not msg_changed and percent < 100:
                 if self._progress_ts and now - self._progress_ts < PROGRESS_THROTTLE_MS:
                     return
-                self._progress_ts = now
+            self._progress_ts = now
             self._progress = percent
+            self._last_progress_message = message
 
             def update():
                 try:
-                    if self._loading_dialog:
+                    dlg = self._loading_dialog
+                    if dlg:
                         try:
-                            self._loading_dialog.set_progress(self._progress)
+                            if hasattr(dlg, "set_progress"):
+                                dlg.set_progress(self._progress)
+                            elif hasattr(dlg, "setProgress"):
+                                dlg.setProgress(self._progress)
+                            raw = dlg.get_dialog() if hasattr(dlg, "get_dialog") else dlg
+                            if raw and hasattr(raw, "setProgress"):
+                                raw.setProgress(self._progress)
                         except Exception:
                             pass
                         try:
-                            self._loading_dialog.set_message(message)
+                            raw = dlg.get_dialog() if hasattr(dlg, "get_dialog") else dlg
+                            if raw and hasattr(raw, "setMessage"):
+                                raw.setMessage(message)
+                            elif hasattr(dlg, "set_message"):
+                                dlg.set_message(message)
                         except Exception:
-                            try:
-                                self._loading_builder.set_message(message)
-                            except Exception:
-                                pass
+                            pass
                 except Exception:
                     pass
 
