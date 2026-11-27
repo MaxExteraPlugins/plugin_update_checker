@@ -30,9 +30,10 @@ except Exception:
 from base_plugin import BasePlugin
 
 try:
-    from hook_utils import find_class
+    from hook_utils import find_class, get_private_field
 except Exception:
     find_class = None
+    get_private_field = None
 
 try:
     from android.view import View
@@ -108,7 +109,7 @@ __id__ = "plugin_update_checker"
 __name__ = "Plugin Update Checker"
 __description__ = "Checking for updates for your installed plugins from multiple channels."
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "3.3.9"
+__version__ = "3.3.11"
 __icon__ = "MaxExteraPluginsStickers/24"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.5.1"
@@ -127,8 +128,12 @@ STRINGS = {
         "channels_saved": "Channels saved",
         "minimize": "Minimize",
         "minimized_info": "The check continues in the background",
-        "show_badge": "Update icon in top bar",
-        "show_badge_sub": "Show an icon in the top bar when plugin updates are available",
+        "show_badge": "Update banner on main screen",
+        "show_badge_sub": "Show a banner above the chat list when plugin updates are available",
+        "updates_bulletin_msg": "{} available",
+        "updates_bulletin_btn": "Open",
+        "banner_title": "Plugin updates available",
+        "banner_tap_hint": "Tap for details",
         "history_header": "History",
         "open_results": "Open last scan results",
         "no_scan": "No scan performed yet",
@@ -224,8 +229,12 @@ STRINGS = {
         "channels_saved": "Каналы сохранены",
         "minimize": "Свернуть",
         "minimized_info": "Проверка продолжится в фоне",
-        "show_badge": "Значок обновлений на панели",
-        "show_badge_sub": "Показывать значок на верхней панели, когда есть обновления плагинов",
+        "show_badge": "Уведомление на главном экране",
+        "show_badge_sub": "Показывать баннер сверху списка чатов, когда есть обновления плагинов",
+        "updates_bulletin_msg": "Доступно {}",
+        "updates_bulletin_btn": "Открыть",
+        "banner_title": "Доступны обновления плагинов",
+        "banner_tap_hint": "Нажмите для подробностей",
         "history_header": "История",
         "open_results": "Открыть результаты последней проверки",
         "no_scan": "Проверок ещё не было",
@@ -1092,6 +1101,8 @@ class PluginUpdateCheckerPlugin(BasePlugin):
 
         self._auto_begin_scheduled = False
         self._injected_btn = None
+        self._banner_cell = None
+        self._banner_dismissed = False
         self._actionbar_hooks_installed = False
         self._pulse_animator = None
         self._pulse_target = None
@@ -1126,6 +1137,16 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         except Exception:
             pass
         self._injected_btn = None
+        try:
+            if self._banner_cell is not None:
+                parent = self._banner_cell.getParent()
+                if parent is not None and hasattr(parent, "setViewVisible"):
+                    parent.setViewVisible(self._banner_cell, False)
+                elif View is not None:
+                    self._banner_cell.setVisibility(View.GONE)
+        except Exception:
+            pass
+        self._banner_cell = None
         self._auto_check_pending = False
         self._wait_pending = False
         self._session += 1
@@ -1741,17 +1762,12 @@ class PluginUpdateCheckerPlugin(BasePlugin):
 
     def _update_actionbar_icon(self):
         try:
-            btn = self._injected_btn
-            if btn is None or View is None:
-                return
-            show = bool(self.get_setting("show_badge", True)) and bool(self._updates)
-            btn.setVisibility(View.VISIBLE if show else View.GONE)
-            if show:
-                self._start_icon_pulse(btn)
-            else:
-                self._stop_icon_pulse()
+            if self._injected_btn is not None and View is not None:
+                self._injected_btn.setVisibility(View.GONE)
+            self._stop_icon_pulse()
         except Exception:
             pass
+        self._inject_icon_now()
 
     def _get_pulse_insets(self, item):
         try:
@@ -1907,44 +1923,123 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             self._reconciling = False
             log(f"Error in _reconcile_stored_updates: {e}")
 
+    def _plural_updates(self, count, with_plugin=False):
+        n = abs(int(count))
+        if self._lang == "ru":
+            mod100 = n % 100
+            mod10 = n % 10
+            if mod100 in (11, 12, 13, 14):
+                form = "обновлений плагинов" if with_plugin else "обновлений"
+            elif mod10 == 1:
+                form = "обновление плагина" if with_plugin else "обновление"
+            elif mod10 in (2, 3, 4):
+                form = "обновления плагинов" if with_plugin else "обновления"
+            else:
+                form = "обновлений плагинов" if with_plugin else "обновлений"
+            return f"{n} {form}"
+        if with_plugin:
+            return f"{n} plugin update" if n == 1 else f"{n} plugin updates"
+        return f"{n} update" if n == 1 else f"{n} updates"
+
+    def _dismiss_banner(self, top_panel, cell):
+        self._banner_dismissed = True
+        try:
+            if top_panel is not None and cell is not None:
+                if hasattr(top_panel, "setViewVisible"):
+                    top_panel.setViewVisible(cell, False)
+                elif View is not None:
+                    cell.setVisibility(View.GONE)
+        except Exception:
+            pass
+
     def _add_icon_to_fragment(self, fragment):
         try:
-            if not self.get_setting("show_badge", True):
-                if self._injected_btn is not None and View is not None:
-                    try:
-                        self._injected_btn.setVisibility(View.GONE)
-                    except Exception:
-                        pass
-                return True
+            if self._injected_btn is not None and View is not None:
+                try:
+                    self._injected_btn.setVisibility(View.GONE)
+                except Exception:
+                    pass
+                self._injected_btn = None
+            self._stop_icon_pulse()
+
             if not self._is_main_dialogs_screen(fragment):
                 return False
-            if View is None or jclass is None or OnClickListener is None:
+            if View is None or find_class is None or OnClickListener is None:
                 return False
-            actionBar = fragment.getActionBar()
-            if not actionBar:
+
+            top_panel = get_private_field(fragment, "topPanelLayout") if get_private_field is not None else None
+            if top_panel is None:
                 return False
-            menu = actionBar.createMenu()
-            if menu is None:
-                return False
+
+            cell = None
             try:
-                existing = menu.getItem(PUC_BUTTON_ID)
+                cell = top_panel.findViewWithTag("puc_updates_banner")
             except Exception:
-                existing = None
-            if existing is not None:
-                self._injected_btn = existing
-                self._update_actionbar_icon()
-                return True
-            R_drawable = jclass("org.telegram.messenger.R$drawable")
-            icon_res = getattr(R_drawable, "msg_download", getattr(R_drawable, "msg_retry", 0))
-            item = menu.addItem(PUC_BUTTON_ID, icon_res)
-            menu.removeView(item)
-            idx = max(0, menu.getChildCount() - 1)
-            menu.addView(item, idx)
-            item.setOnClickListener(OnClickListener(lambda v: self._show_results_dialog()))
-            self._injected_btn = item
-            self._update_actionbar_icon()
+                cell = None
+
+            updates = getattr(self, "_updates", []) or []
+            show = bool(self.get_setting("show_badge", True)) and bool(updates) and not bool(getattr(self, "_banner_dismissed", False))
+
+            if cell is None:
+                if not show:
+                    return True
+                hint_cls = find_class("org.telegram.ui.Cells.DialogsHintCell")
+                if hint_cls is None:
+                    return False
+                ctx = top_panel.getContext()
+                if ctx is None:
+                    return False
+                cell = hint_cls(ctx)
+                try:
+                    cell.setTag("puc_updates_banner")
+                except Exception:
+                    pass
+                try:
+                    if Theme is not None:
+                        cell.setBackground(Theme.getSelectorDrawable(False))
+                except Exception:
+                    pass
+                top_panel.addView(cell)
+
+            self._banner_cell = cell
+
+            if show:
+                title = self._s("banner_title")
+                sub = f"{self._plural_updates(len(updates), with_plugin=False)} \u00B7 {self._s('banner_tap_hint')}"
+                try:
+                    cell.setText(title, sub, False, False)
+                except Exception:
+                    try:
+                        cell.setText(title, sub)
+                    except Exception:
+                        pass
+                cell.setOnClickListener(OnClickListener(lambda v: self._show_results_dialog()))
+                try:
+                    cell.setOnCloseListener(OnClickListener(lambda v, tp=top_panel, c=cell: self._dismiss_banner(tp, c)))
+                except Exception:
+                    pass
+                try:
+                    cell.updateColors()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(top_panel, "setViewVisible"):
+                        top_panel.setViewVisible(cell, True)
+                    else:
+                        cell.setVisibility(View.VISIBLE)
+                except Exception:
+                    pass
+            else:
+                try:
+                    if hasattr(top_panel, "setViewVisible"):
+                        top_panel.setViewVisible(cell, False)
+                    else:
+                        cell.setVisibility(View.GONE)
+                except Exception:
+                    pass
             return True
-        except Exception:
+        except Exception as e:
+            log(f"Error updating main screen banner: {e}")
             return False
 
     def _on_badge_toggle(self, enabled):
@@ -2804,16 +2899,20 @@ class PluginUpdateCheckerPlugin(BasePlugin):
                     pass
             self._set_progress(PROGRESS_FINALIZE, self._s("comparing_versions"))
             self._store_last_results()
+            if updates:
+                self._banner_dismissed = False
             run_on_ui_thread(self._inject_icon_now)
             self._last_scan_exists = True
 
             if self._silent_mode:
                 if updates:
-                    run_on_ui_thread(self._show_results_dialog)
+                    run_on_ui_thread(self._show_updates_bulletin)
             else:
                 self._set_progress(100, self._s("done"))
                 run_on_ui_thread(self._dismiss_loading_dialog)
                 run_on_ui_thread(self._show_results_dialog)
+                if updates:
+                    run_on_ui_thread(self._show_updates_bulletin)
 
             try:
                 self.set_setting("last_check_ts", time.time())
@@ -3549,6 +3648,44 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         except Exception:
             pass
         return fallback
+
+    def _show_updates_bulletin(self):
+        try:
+            count = len(getattr(self, "_updates", []) or [])
+            if count <= 0:
+                return
+            msg = self._s("updates_bulletin_msg", self._plural_updates(count, with_plugin=True))
+            btn_text = self._s("updates_bulletin_btn")
+            icon_res = 0
+            try:
+                from org.telegram.messenger import R
+                icon_res = getattr(R.raw, "ic_download", getattr(R.raw, "info", 0))
+            except Exception:
+                icon_res = 0
+            try:
+                BulletinHelper.show_with_button(
+                    msg,
+                    icon_res,
+                    btn_text,
+                    lambda: self._show_results_dialog(),
+                    duration=7000,
+                )
+                return
+            except Exception:
+                pass
+            try:
+                from org.telegram.ui.Components import BulletinFactory
+                frag = get_last_fragment()
+                factory = BulletinFactory.of(frag) if frag is not None else BulletinFactory.global_()
+                b = factory.createSimpleBulletin(icon_res, msg)
+                b.setDuration(7000)
+                b.show()
+                return
+            except Exception:
+                pass
+            BulletinHelper.show_info(msg)
+        except Exception as e:
+            log(f"Error showing updates bulletin: {e}")
 
     def _show_results_dialog(self):
         try:
